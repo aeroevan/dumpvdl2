@@ -19,12 +19,9 @@
 #include <inttypes.h>           // PRIx64, PRIu64
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>             // strtol()
-#include <string.h>             // strlen()
-#include <strings.h>            // strcasecmp()
 #include <unistd.h>             // _exit(), usleep()
 #include <airspyhf.h>
-#include "dumpvdl2.h"           // do_exit, process_buf_cf32(), XCALLOC(), XFREE(), ASSERT()
+#include "dumpvdl2.h"           // do_exit, process_buf_cf32(), sdr_*(), XCALLOC(), XFREE()
 #include "airspyhf.h"
 
 // NOTE: libairspyhf owns the airspyhf_* namespace (airspyhf_start() in
@@ -47,14 +44,6 @@ static char const *airspyhf_strerror(int e) {
 	}
 }
 
-static void airspyhf_verbose_device_search(uint64_t *serials, int count) {
-	fprintf(stderr, "Found %d device(s):\n", count);
-	for(int i = 0; i < count; i++) {
-		fprintf(stderr, "  %d:  SN: %016" PRIx64 "\n", i, serials[i]);
-	}
-	fprintf(stderr, "\n");
-}
-
 // Opens the Airspy HF+ device selected by dev (a device index or a serial
 // number, possibly abbreviated) and decides which sample rate to run it at.
 // Returns the chosen rate, which the caller needs in order to set up the
@@ -69,30 +58,8 @@ uint32_t input_airspyhf_open_device(char *dev, uint32_t sample_rate) {
 	if(count > AIRSPYHF_MAX_DEVICES) {
 		count = AIRSPYHF_MAX_DEVICES;
 	}
-	airspyhf_verbose_device_search(serials, count);
-
-	// Select the device by index, then by exact serial number, then by a
-	// suffix of it (which is what the device labels usually show).
-	uint64_t serial = 0;
-	char *endptr = NULL;
-	long index = strtol(dev, &endptr, 10);
-	if(endptr[0] == '\0' && index >= 0 && index < count && strlen(dev) < 5) {
-		serial = serials[index];
-	} else {
-		size_t devlen = strlen(dev);
-		for(int i = 0; i < count && serial == 0; i++) {
-			char sn[17];
-			snprintf(sn, sizeof(sn), "%016" PRIx64, serials[i]);
-			if(strcasecmp(dev, sn) == 0 ||
-					(devlen < 16 && strcasecmp(dev, sn + 16 - devlen) == 0)) {
-				serial = serials[i];
-			}
-		}
-	}
-	if(serial == 0) {
-		fprintf(stderr, "No matching devices found.\n");
-		_exit(1);
-	}
+	sdr_device_list_print(serials, count);
+	uint64_t serial = sdr_serial_select(dev, serials, count);
 	int r = airspyhf_open_sn(&airspyhf, serial);
 	if(r != AIRSPYHF_SUCCESS) {
 		fprintf(stderr, "Failed to open Airspy HF+ device %016" PRIx64 ": %s\n",
@@ -116,36 +83,13 @@ uint32_t input_airspyhf_open_device(char *dev, uint32_t sample_rate) {
 		fprintf(stderr, "Failed to read supported sample rates: %s\n", airspyhf_strerror(r));
 		_exit(1);
 	}
-	uint32_t chosen = 0;
-	if(sample_rate == 0) {
-		// Default to the *highest* supported rate, which is the opposite of
-		// what the Airspy R2/Mini driver does. Those start at a few Msps, so
-		// the lowest rate is both the cheapest to process and wide enough for
-		// the whole VDL2 band. The HF+ tops out at 768 kHz (912 kHz on some
-		// firmware) and goes down to 192 kHz, which would not fit the band -
-		// and even the highest rate is cheap to process by comparison.
-		for(uint32_t i = 0; i < rate_count; i++) {
-			if(rates[i] > chosen) {
-				chosen = rates[i];
-			}
-		}
-	} else {
-		for(uint32_t i = 0; i < rate_count; i++) {
-			if(rates[i] == sample_rate) {
-				chosen = sample_rate;
-				break;
-			}
-		}
-		if(chosen == 0) {
-			fprintf(stderr, "Sample rate %u is not supported by this device. Supported rates:",
-					sample_rate);
-			for(uint32_t i = 0; i < rate_count; i++) {
-				fprintf(stderr, " %u", rates[i]);
-			}
-			fprintf(stderr, "\n");
-			_exit(1);
-		}
-	}
+	// Default to the *highest* supported rate, which is the opposite of what
+	// the Airspy R2/Mini driver does. Those start at a few Msps, so the lowest
+	// rate is both the cheapest to process and wide enough for the whole VDL2
+	// band. The HF+ tops out at 768 kHz (912 kHz on some firmware) and goes
+	// down to 192 kHz, which would not fit the band - and even the highest
+	// rate is cheap to process by comparison.
+	uint32_t chosen = sdr_sample_rate_select(rates, rate_count, sample_rate, true);
 	XFREE(rates);
 	// Must happen before the frequency is set - the rate decides whether the
 	// device tunes zero-IF or low-IF.
@@ -171,9 +115,6 @@ static int airspyhf_rx_callback(airspyhf_transfer_t *transfer) {
 	}
 	// libairspyhf delivers airspyhf_complex_float_t, ie. pairs of floats
 	// already scaled to <-1;1>, which is what process_buf_cf32() expects.
-	// Block sizes are decided by the library and may vary, so sbuf is not
-	// preallocated here - process_buf_cf32() sizes it at the only point where
-	// doing so is safe.
 	process_buf_cf32((float *)transfer->samples, (uint32_t)transfer->sample_count * 2, NULL);
 	return 0;
 }
@@ -281,6 +222,7 @@ void input_airspyhf_start(vdl2_state_t *ctx, uint32_t centerfreq, int agc, int a
 
 	// Not every HF+ variant has a bias tee, so a failure here is only fatal
 	// when the user has actually asked for it to be turned on.
+#ifdef HAVE_AIRSPYHF_BIAS_TEE
 	r = airspyhf_set_bias_tee(airspyhf, biast ? 1 : 0);
 	if(r != AIRSPYHF_SUCCESS) {
 		if(biast) {
@@ -290,6 +232,14 @@ void input_airspyhf_start(vdl2_state_t *ctx, uint32_t centerfreq, int agc, int a
 	} else {
 		fprintf(stderr, "Bias tee %s\n", biast ? "enabled" : "disabled");
 	}
+#else
+	// Older libairspyhf releases have no bias tee control at all.
+	if(biast) {
+		fprintf(stderr, "Bias tee control requires a newer libairspyhf than the one "
+				"dumpvdl2 has been built with\n");
+		_exit(1);
+	}
+#endif
 
 	r = airspyhf_start(airspyhf, airspyhf_rx_callback, NULL);
 	if(r != AIRSPYHF_SUCCESS) {
@@ -299,6 +249,13 @@ void input_airspyhf_start(vdl2_state_t *ctx, uint32_t centerfreq, int agc, int a
 	fprintf(stderr, "Device started\n");
 	while(do_exit == 0 && airspyhf_is_streaming(airspyhf)) {
 		usleep(200000);
+	}
+	// Streaming only stops on its own when something has gone wrong (eg. the
+	// device has been unplugged). Exit with an error, so that a supervisor
+	// such as systemd knows to restart the program.
+	if(do_exit == 0) {
+		fprintf(stderr, "Device has stopped streaming unexpectedly\n");
+		_exit(1);
 	}
 	airspyhf_stop(airspyhf);
 	airspyhf_close(airspyhf);

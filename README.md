@@ -645,6 +645,10 @@ from 0 to 48 dB of attenuation), which turns the AGC off unless you also pass
 The HF+ stores a frequency calibration of its own in flash, which dumpvdl2
 leaves alone by default; give `--correction` to override it for the run.
 
+`--biast 1` powers an active antenna through the bias tee, on models which have
+one. Bias tee control was added to `libairspyhf` later than the rest of the API;
+if dumpvdl2 was built against a release without it, `--biast 1` is rejected.
+
 Type `./dumpvdl2 --help` to find out all the options and their default values.
 
 ### SoapySDR library

@@ -101,16 +101,18 @@
 #define __OPT_SAMPLE_RATE            29
 #define __OPT_RESAMPLER              30
 
+// NOTE: no option may use 63 - that is '?', which getopt_long() returns for
+// an unknown option or a missing argument.
 #ifdef WITH_AIRSPY
-#define __OPT_AIRSPY                 60
-#define __OPT_LINEARITY_GAIN         61
-#define __OPT_SENSITIVITY_GAIN       62
-#define __OPT_LNA_GAIN               63
-#define __OPT_MIXER_GAIN             64
-#define __OPT_VGA_GAIN               65
-#define __OPT_LNA_AGC                66
-#define __OPT_MIXER_AGC              67
-#define __OPT_PACKING                68
+#define __OPT_AIRSPY                 120
+#define __OPT_LINEARITY_GAIN         121
+#define __OPT_SENSITIVITY_GAIN       122
+#define __OPT_LNA_GAIN               123
+#define __OPT_MIXER_GAIN             124
+#define __OPT_VGA_GAIN               125
+#define __OPT_LNA_AGC                126
+#define __OPT_MIXER_AGC              127
+#define __OPT_PACKING                128
 #endif
 
 #ifdef WITH_SDRPLAY3
@@ -407,7 +409,6 @@ void bitstream_destroy(bitstream_t *bs);
 uint32_t reverse(uint32_t v, int numbits);
 
 // demod.c
-extern float *sbuf;
 vdl2_channel_t *vdl2_channel_init(uint32_t centerfreq, uint32_t freq, uint32_t source_rate, float oversample);
 void sincosf_lut_init();
 void input_lpf_init(uint32_t sample_rate);
@@ -485,6 +486,10 @@ void octet_string_destroy(octet_string_t *ostring);
 char *hexdump(uint8_t *data, size_t len);
 void append_hexdump_with_indent(la_vstring *vstr, uint8_t *data, size_t len, int indent);
 la_proto_node *unknown_proto_pdu_new(void *buf, size_t len);
+void sdr_device_list_print(uint64_t const *serials, int count);
+uint64_t sdr_serial_select(char const *dev, uint64_t const *serials, int count);
+uint32_t sdr_sample_rate_select(uint32_t const *rates, uint32_t count, uint32_t requested,
+		bool prefer_highest);
 
 // dumpvdl2.c
 extern int do_exit;

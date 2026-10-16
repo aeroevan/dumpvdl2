@@ -48,7 +48,9 @@
 // do not change this; filtering routine is currently hardcoded to 2 poles to minimize CPU usage
 #define INP_LPF_NPOLES 2
 
-float *sbuf;
+// Sample buffer shared with the demodulator threads. Owned by this file
+// alone - it is sized on demand by the process_buf_* converters.
+static float *sbuf;
 static float *levels;
 static float sin_lut[257], cos_lut[257];
 static uint32_t sbuf_len;
@@ -365,9 +367,9 @@ void *process_samples(void *arg) {
 	}
 }
 
-// Makes sure sbuf can hold at least float_cnt samples. Input drivers which
-// deliver fixed-size blocks size sbuf themselves, but the block size is not
-// always known in advance (libairspy picks its own), so grow it on demand.
+// Makes sure sbuf can hold at least float_cnt samples. Block sizes vary
+// between input drivers (and libairspy picks its own), so sbuf is grown on
+// demand rather than allocated up front.
 // MUST only be called between the demods_ready and samples_ready barriers -
 // anywhere else the demodulator threads may still be reading the buffer.
 static void sbuf_ensure_capacity(uint32_t float_cnt) {
@@ -377,9 +379,15 @@ static void sbuf_ensure_capacity(uint32_t float_cnt) {
 	}
 }
 
-// Returns a staging buffer of at least len floats, to be filled with samples
-// which are then resampled into sbuf.
-static float *staging_buf_get(uint32_t len) {
+// Returns a buffer of at least len floats for a converter to write samples
+// into. That is sbuf itself, unless the samples are going to be resampled -
+// then it is a staging buffer, and the resampler writes to sbuf instead.
+// MUST only be called between the demods_ready and samples_ready barriers.
+static float *conv_buf_get(uint32_t len) {
+	if(input_resampler == NULL) {
+		sbuf_ensure_capacity(len);
+		return sbuf;
+	}
 	if(len > rsbuf_size) {
 		rsbuf = XREALLOC(rsbuf, len * sizeof(float));
 		rsbuf_size = len;
@@ -387,22 +395,34 @@ static float *staging_buf_get(uint32_t len) {
 	return rsbuf;
 }
 
+// Hands len floats of converted samples over to the demodulator threads,
+// resampling them first if necessary. buf is either a buffer returned by
+// conv_buf_get() or one which already holds float samples.
+// MUST only be called between the demods_ready and samples_ready barriers.
+static void samples_publish(float const *buf, uint32_t len) {
+	// Samples are I/Q pairs. A block may still end half way through one (the
+	// final short read of an IQ file, for example), so drop the odd float out.
+	len &= ~1u;
+	if(input_resampler != NULL) {
+		sbuf_ensure_capacity(resampler_output_len_max(input_resampler, len));
+		sbuf_len = resampler_process(input_resampler, buf, len, sbuf);
+	} else {
+		if(buf != sbuf) {
+			sbuf_ensure_capacity(len);
+			memcpy(sbuf, buf, len * sizeof(float));
+		}
+		sbuf_len = len;
+	}
+}
+
 void process_buf_uchar(unsigned char *buf, uint32_t len, void *ctx) {
 	UNUSED(ctx);
 	if(len == 0) return;
 	pthread_barrier_wait(&demods_ready);
-	if(input_resampler != NULL) {
-		sbuf_ensure_capacity(resampler_output_len_max(input_resampler, len));
-		float *staging = staging_buf_get(len);
-		for(uint32_t i = 0; i < len; i++)
-			staging[i] = levels[buf[i]];
-		sbuf_len = resampler_process(input_resampler, staging, len, sbuf);
-	} else {
-		sbuf_ensure_capacity(len);
-		sbuf_len = len;
-		for(uint32_t i = 0; i < sbuf_len; i++)
-			sbuf[i] = levels[buf[i]];
-	}
+	float *out = conv_buf_get(len);
+	for(uint32_t i = 0; i < len; i++)
+		out[i] = levels[buf[i]];
+	samples_publish(out, len);
 	pthread_barrier_wait(&samples_ready);
 }
 
@@ -419,18 +439,10 @@ void process_buf_short(unsigned char *buf, uint32_t len, void *ctx) {
 	int16_t *bbuf = (int16_t *)buf;
 	pthread_barrier_wait(&demods_ready);
 	uint32_t sample_cnt = len / 2;
-	if(input_resampler != NULL) {
-		sbuf_ensure_capacity(resampler_output_len_max(input_resampler, sample_cnt));
-		float *staging = staging_buf_get(sample_cnt);
-		for(uint32_t i = 0; i < sample_cnt; i++)
-			staging[i] = (float)bbuf[i] / 32768.0f;
-		sbuf_len = resampler_process(input_resampler, staging, sample_cnt, sbuf);
-	} else {
-		sbuf_ensure_capacity(sample_cnt);
-		sbuf_len = sample_cnt;
-		for(uint32_t i = 0; i < sbuf_len; i++)
-			sbuf[i] = (float)bbuf[i] / 32768.0f;
-	}
+	float *out = conv_buf_get(sample_cnt);
+	for(uint32_t i = 0; i < sample_cnt; i++)
+		out[i] = (float)bbuf[i] / 32768.0f;
+	samples_publish(out, sample_cnt);
 	pthread_barrier_wait(&samples_ready);
 }
 
@@ -443,16 +455,7 @@ void process_buf_cf32(float *buf, uint32_t len, void *ctx) {
 	UNUSED(ctx);
 	if(len == 0) return;
 	pthread_barrier_wait(&demods_ready);
-	if(input_resampler != NULL) {
-		sbuf_ensure_capacity(resampler_output_len_max(input_resampler, len));
-		// No staging buffer here - the input is already in the layout the
-		// resampler expects, so it can be read from in place.
-		sbuf_len = resampler_process(input_resampler, buf, len, sbuf);
-	} else {
-		sbuf_ensure_capacity(len);
-		sbuf_len = len;
-		memcpy(sbuf, buf, len * sizeof(float));
-	}
+	samples_publish(buf, len);
 	pthread_barrier_wait(&samples_ready);
 }
 

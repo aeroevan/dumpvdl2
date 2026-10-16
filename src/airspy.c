@@ -19,12 +19,11 @@
 #include <inttypes.h>           // PRIx64, PRIu64
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>             // strtol()
-#include <string.h>             // strlen()
-#include <strings.h>            // strcasecmp()
 #include <unistd.h>             // _exit(), usleep()
-#include <libairspy/airspy.h>
-#include "dumpvdl2.h"           // do_exit, process_buf_short(), XCALLOC(), XFREE(), ASSERT()
+// pkg-config puts the libairspy directory itself on the include path, so the
+// header has to be named without it.
+#include <airspy.h>
+#include "dumpvdl2.h"           // do_exit, process_buf_short(), sdr_*(), XCALLOC(), XFREE()
 #include "airspy.h"
 
 // NOTE: libairspy owns the airspy_* namespace, so the entry points here are
@@ -32,14 +31,6 @@
 // is a libairspy function.
 
 static struct airspy_device *airspy = NULL;
-
-static void airspy_verbose_device_search(uint64_t *serials, int count) {
-	fprintf(stderr, "Found %d device(s):\n", count);
-	for(int i = 0; i < count; i++) {
-		fprintf(stderr, "  %d:  SN: %016" PRIx64 "\n", i, serials[i]);
-	}
-	fprintf(stderr, "\n");
-}
 
 // Opens the Airspy device selected by dev (a device index or a serial number,
 // possibly abbreviated) and decides which sample rate to run it at. Returns
@@ -60,30 +51,8 @@ uint32_t airspy_open_device(char *dev, uint32_t sample_rate) {
 	if(count > AIRSPY_MAX_DEVICES) {
 		count = AIRSPY_MAX_DEVICES;
 	}
-	airspy_verbose_device_search(serials, count);
-
-	// Select the device by index, then by exact serial number, then by a
-	// suffix of it (which is what the device labels usually show).
-	uint64_t serial = 0;
-	char *endptr = NULL;
-	long index = strtol(dev, &endptr, 10);
-	if(endptr[0] == '\0' && index >= 0 && index < count && strlen(dev) < 5) {
-		serial = serials[index];
-	} else {
-		size_t devlen = strlen(dev);
-		for(int i = 0; i < count && serial == 0; i++) {
-			char sn[17];
-			snprintf(sn, sizeof(sn), "%016" PRIx64, serials[i]);
-			if(strcasecmp(dev, sn) == 0 ||
-					(devlen < 16 && strcasecmp(dev, sn + 16 - devlen) == 0)) {
-				serial = serials[i];
-			}
-		}
-	}
-	if(serial == 0) {
-		fprintf(stderr, "No matching devices found.\n");
-		_exit(1);
-	}
+	sdr_device_list_print(serials, count);
+	uint64_t serial = sdr_serial_select(dev, serials, count);
 	r = airspy_open_sn(&airspy, serial);
 	if(r != AIRSPY_SUCCESS) {
 		fprintf(stderr, "Failed to open Airspy device %016" PRIx64 ": %s\n",
@@ -107,33 +76,9 @@ uint32_t airspy_open_device(char *dev, uint32_t sample_rate) {
 		fprintf(stderr, "Failed to read supported sample rates: %s\n", airspy_error_name(r));
 		_exit(1);
 	}
-	uint32_t chosen = 0;
-	if(sample_rate == 0) {
-		// Default to the lowest supported rate - it is the cheapest one to
-		// process and it still covers the whole VDL2 band.
-		chosen = rates[0];
-		for(uint32_t i = 1; i < rate_count; i++) {
-			if(rates[i] < chosen) {
-				chosen = rates[i];
-			}
-		}
-	} else {
-		for(uint32_t i = 0; i < rate_count; i++) {
-			if(rates[i] == sample_rate) {
-				chosen = sample_rate;
-				break;
-			}
-		}
-		if(chosen == 0) {
-			fprintf(stderr, "Sample rate %u is not supported by this device. Supported rates:",
-					sample_rate);
-			for(uint32_t i = 0; i < rate_count; i++) {
-				fprintf(stderr, " %u", rates[i]);
-			}
-			fprintf(stderr, "\n");
-			_exit(1);
-		}
-	}
+	// Default to the lowest supported rate - it is the cheapest one to
+	// process and it still covers the whole VDL2 band.
+	uint32_t chosen = sdr_sample_rate_select(rates, rate_count, sample_rate, false);
 	XFREE(rates);
 	r = airspy_set_samplerate(airspy, chosen);
 	if(r != AIRSPY_SUCCESS) {
@@ -156,9 +101,7 @@ static int airspy_rx_callback(airspy_transfer *transfer) {
 				transfer->dropped_samples);
 	}
 	// AIRSPY_SAMPLE_INT16_IQ delivers two int16 values per sample, which is
-	// what process_buf_short() expects. Block sizes are decided by libairspy
-	// and may vary, so sbuf is not preallocated here - process_buf_short()
-	// sizes it at the only point where doing so is safe.
+	// what process_buf_short() expects.
 	process_buf_short(transfer->samples, (uint32_t)transfer->sample_count * 2 * sizeof(int16_t), NULL);
 	return 0;
 }
@@ -209,8 +152,11 @@ void airspy_start(vdl2_state_t *ctx, uint32_t centerfreq, int linearity_gain, in
 		_exit(1);
 	}
 	// The Airspy has no frequency correction setting of its own, so apply it
-	// to the tuned frequency instead.
-	uint32_t tuned_freq = (uint32_t)((double)centerfreq * (1.0 + (double)correction / 1e6));
+	// to the tuned frequency instead. As with the other drivers, a positive
+	// correction means the reference clock runs fast - so the device lands
+	// on (1 + ppm/1e6) times whatever it is asked for, and the request has
+	// to be scaled down by the same factor to compensate.
+	uint32_t tuned_freq = (uint32_t)((double)centerfreq / (1.0 + (double)correction / 1e6) + 0.5);
 	r = airspy_set_freq(airspy, tuned_freq);
 	if(r != AIRSPY_SUCCESS) {
 		fprintf(stderr, "Failed to set frequency to %u Hz: %s\n", tuned_freq, airspy_error_name(r));
@@ -287,6 +233,13 @@ void airspy_start(vdl2_state_t *ctx, uint32_t centerfreq, int linearity_gain, in
 	fprintf(stderr, "Device started\n");
 	while(do_exit == 0 && airspy_is_streaming(airspy) == AIRSPY_TRUE) {
 		usleep(200000);
+	}
+	// Streaming only stops on its own when something has gone wrong (eg. the
+	// device has been unplugged). Exit with an error, so that a supervisor
+	// such as systemd knows to restart the program.
+	if(do_exit == 0) {
+		fprintf(stderr, "Device has stopped streaming unexpectedly\n");
+		_exit(1);
 	}
 	airspy_stop_rx(airspy);
 	airspy_close(airspy);

@@ -351,11 +351,9 @@ void process_iq_file(vdl2_state_t *ctx, char *path, enum sample_formats sfmt) {
 	switch(sfmt) {
 		case SFMT_U8:
 			process_buf_uchar_init();
-			sbuf = XCALLOC(FILE_BUFSIZE / sizeof(uint8_t), sizeof(float));
 			process_buf = &process_buf_uchar;
 			break;
 		case SFMT_S16_LE:
-			sbuf = XCALLOC(FILE_BUFSIZE / sizeof(int16_t), sizeof(float));
 			process_buf = &process_buf_short;
 			break;
 		default:
